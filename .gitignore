@@ -15,3 +15,5 @@ Thumbs.db
 # Nix
 result
 result-*
+name.txt
+*.rar
