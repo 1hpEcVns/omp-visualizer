@@ -6,8 +6,8 @@ use axum::{
     Router,
 };
 use serde::Deserialize;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use parking_lot::Mutex;
 use tower_http::compression::CompressionLayer;
 use flate2::write::GzEncoder;
 use std::io::Write;
@@ -32,10 +32,13 @@ pub fn page_routes() -> Router<AppState> {
         .route("/", get(dashboard))
         .route("/conversation/{session_id}", get(conversation_page))
         .route("/conversation/omp/{session_id}", get(conversation_page))
+        .fallback(handle_404)
 }
 
 pub fn api_routes() -> Router<AppState> {
     Router::new()
+        .route("/health", get(api_health))
+        .route("/search", get(api_global_search))
         .route("/sessions", get(api_sessions))
         .route("/conversation/omp/{session_id}", get(api_conversation))
         .route("/conversation/omp/{session_id}/timeline", get(api_timeline))
@@ -58,7 +61,7 @@ pub fn default_state() -> AppState {
             Err(_) => continue,
         }
     }
-    let mut tera = tera.unwrap_or_else(|| {
+    let tera = tera.unwrap_or_else(|| {
         tracing::warn!("No templates found, using empty Tera");
         tera::Tera::default()
     });
@@ -80,7 +83,7 @@ pub fn default_state() -> AppState {
 // ── Dashboard Page ─────────────────────────────────────────────────
 
 async fn dashboard(State(state): State<AppState>) -> impl IntoResponse {
-    let sessions = store::list_sessions(&state.sessions_dir);
+    let sessions = store::list_sessions(&state.sessions_dir, None);
 
     let mut context = tera::Context::new();
     context.insert("title", "OMP Visualizer");
@@ -126,7 +129,7 @@ async fn conversation_page(
     Path(session_id): Path<String>,
     Query(params): Query<ConversationPageParams>,
 ) -> impl IntoResponse {
-    let sessions = store::list_sessions(&state.sessions_dir);
+    let sessions = store::list_sessions(&state.sessions_dir, None);
     let summary = sessions.iter().find(|s| s.id == session_id);
 
     let initial_layout = match params.layout.as_deref() {
@@ -211,8 +214,64 @@ fn conversation_page_fallback(summary: &ConversationSummary) -> String {
     )
 }
 
+
+// ── API: Health Check ─────────────────────────────────────────────
+
+async fn api_health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "ok",
+        "version": env!("CARGO_PKG_VERSION"),
+        "agent": "omp",
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
+// ── API: Global Search ────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct GlobalSearchQuery {
+    q: String,
+    limit: Option<usize>,
+}
+
+async fn api_global_search(
+    State(state): State<AppState>,
+    Query(params): Query<GlobalSearchQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+    let limit = params.limit.unwrap_or(20);
+    let index = state.index.lock();
+    let results = index.search_fts(&params.q, limit)
+        .map_err(|e| {
+            tracing::error!("Global search error: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    drop(index);
+    Ok(Json(results.into_iter().map(|r| serde_json::json!({
+        "sessionId": r.session_id,
+        "title": r.title,
+        "directory": r.directory,
+        "snippet": r.snippet,
+    })).collect()))
+}
+
+// ── 404 Handler ───────────────────────────────────────────────────
+
+async fn handle_404() -> impl IntoResponse {
+    (StatusCode::NOT_FOUND, Html(r#"<!doctype html>
+<html><head><meta charset="UTF-8"><title>404 - OMP Visualizer</title>
+<link rel="stylesheet" href="/static/css/base.css"></head>
+<body style="display:flex;align-items:center;justify-content:center;min-height:100vh;background:#0a0a0f;color:#e0e0e0;font-family:system-ui,sans-serif">
+<div style="text-align:center">
+<h1 style="font-size:72px;color:#6c5ce7;margin:0">404</h1>
+<p style="font-size:24px;color:#888;margin:16px 0">Page not found</p>
+<a href="/" style="color:#a29bfe;font-size:18px">Back to dashboard</a>
+</div></body></html>"#))
+}
+
+
 // ── API: Session Listing ───────────────────────────────────────────
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 struct SessionsQuery {
     agent: Option<String>,
@@ -224,7 +283,9 @@ async fn api_sessions(
     State(state): State<AppState>,
     Query(params): Query<SessionsQuery>,
 ) -> Json<Vec<ConversationSummary>> {
-    let sessions = store::list_sessions(&state.sessions_dir);
+    let index = state.index.lock();
+    let sessions = store::list_sessions(&state.sessions_dir, Some(&*index));
+    drop(index);
     let filtered = store::filter_sessions(
         &sessions,
         &params.q.unwrap_or_default(),
@@ -271,7 +332,7 @@ async fn api_timeline(
 
     // Check cache
     if let Some(fp) = &fingerprint {
-        let index = state.index.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        let index = state.index.lock();
         if let Some(cached) = index.get_cached_boot(&session_id, fp) {
             drop(index);
             // Check If-None-Match for 304
@@ -321,19 +382,13 @@ async fn api_timeline(
 
     let etag = fingerprint.as_ref().map(|fp| format!("\"{}\"", fp));
 
-    let accept_encoding = req.headers()
-        .get(header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
     // Store in cache for future requests
-    if let (Some(fp), Some(etag_str)) = (&fingerprint, &etag) {
-        if let Ok(index) = state.index.lock() {
-            let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::new(6));
-            if encoder.write_all(&body).is_ok() {
-                if let Ok(compressed) = encoder.finish() {
-                    let _ = index.store_boot(&session_id, fp, &compressed);
-                }
+    if let (Some(fp), Some(_etag_str)) = (&fingerprint, &etag) {
+        let index = state.index.lock();
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+        if encoder.write_all(&body).is_ok() {
+            if let Ok(compressed) = encoder.finish() {
+                let _ = index.store_boot(&session_id, fp, &compressed);
             }
         }
     }
@@ -345,7 +400,7 @@ async fn api_timeline(
 
     let mut resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json");
-    if let Some(ref etag_str) = etag {
+    if let Some(etag_str) = &etag {
         resp = resp.header("etag", etag_str);
     }
 
@@ -397,6 +452,28 @@ fn build_timeline_payload(
     );
     tracing::info!("Built {} seeds", seeds.len());
 
+    // Load subagent track skeletons
+    let subagent_transcripts = build_subagent_skeletons(&session_file, session_id, &state.sessions_dir);
+
+    // Populate FTS index with session content
+    {
+        let mut all_text = String::new();
+        for entry in &parsed.entries {
+            if let SessionEntry::Message(msg) = entry {
+                for block in &msg.message.content {
+                    match block {
+                        ContentBlock::Text { text } => { all_text.push_str(text); all_text.push(' '); }
+                        ContentBlock::Thinking { thinking, .. } => { all_text.push_str(thinking); all_text.push(' '); }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let index = state.index.lock(); {
+            let _ = index.update_fts(session_id, parsed.header.title.as_deref(), &parsed.header.cwd, &all_text);
+        }
+    }
+
     tracing::info!("Building JSON response...");
     Ok(serde_json::json!({
         "protocol": 2,
@@ -406,12 +483,12 @@ fn build_timeline_payload(
             "title": parsed.header.title,
             "model": "Unknown",
             "messageCount": parsed.entries.len(),
-            "subagentCount": 0,
+            "subagentCount": subagent_transcripts.len(),
         },
         "capsule_seeds": seeds,
         "message_count": 0,
         "raw_event_count": 0,
-        "subagent_transcripts": [],
+        "subagent_transcripts": subagent_transcripts,
     }))
 }
 
@@ -444,7 +521,7 @@ fn build_subagent_skeletons(
                         0,
                     );
 
-                    let ts = chrono::DateTime::parse_from_rfc3339(&parsed.header.timestamp)
+                    let _ts = chrono::DateTime::parse_from_rfc3339(&parsed.header.timestamp)
                         .ok()
                         .map(|dt| dt.timestamp_millis());
 

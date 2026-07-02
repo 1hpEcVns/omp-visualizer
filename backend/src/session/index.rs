@@ -1,5 +1,4 @@
 use rusqlite::{Connection, params};
-use std::path::PathBuf;
 use std::fs;
 use sha2::{Sha256, Digest};
 
@@ -49,8 +48,8 @@ impl SessionIndex {
                 created_at TEXT
             );
 
-            CREATE VIRTUAL TABLE IF NOT EXISTS session_fts USING fts5(
-                title, directory, content
+            CREATE VIRTUAL TABLE IF NOT EXISTS session_search USING fts5(
+                session_id, title, directory, content
             );
         ").map_err(|e| format!("Schema error: {}", e))?;
 
@@ -122,18 +121,20 @@ impl SessionIndex {
 
     /// Update FTS index for a session.
     pub fn update_fts(&self, id: &str, title: Option<&str>, directory: &str, content: &str) -> Result<(), String> {
-        // Delete old entry, insert new
-        self.conn.execute("DELETE FROM session_fts WHERE rowid = (SELECT rowid FROM session_fts WHERE session_fts MATCH ?1 LIMIT 1)", params![id]).ok();
         self.conn.execute(
-            "INSERT INTO session_fts (title, directory, content) VALUES (?1, ?2, ?3)",
-            params![title.unwrap_or(""), directory, content],
-        ).map_err(|e| format!("FTS error: {}", e))?;
+            "DELETE FROM session_search WHERE session_id = ?1",
+            params![id],
+        ).map_err(|e| format!("FTS delete error: {}", e))?;
+        self.conn.execute(
+            "INSERT INTO session_search (session_id, title, directory, content) VALUES (?1, ?2, ?3, ?4)",
+            params![id, title.unwrap_or(""), directory, content],
+        ).map_err(|e| format!("FTS insert error: {}", e))?;
         Ok(())
     }
 
-    /// Search FTS index for sessions matching query.
+    /// Search FTS index across all indexed sessions.
+    /// Search FTS index across all indexed sessions.
     pub fn search_fts(&self, query: &str, limit: usize) -> Result<Vec<FtsResult>, String> {
-        // FTS5 syntax: escape special chars, use prefix matching
         let sanitized = query.replace(|c: char| !c.is_alphanumeric() && c != ' ', " ");
         let fts_query = sanitized.split_whitespace()
             .map(|w| format!("{}*", w))
@@ -145,14 +146,16 @@ impl SessionIndex {
         }
 
         let mut stmt = self.conn.prepare(
-            "SELECT title, directory, snippet(session_fts, 1, '<mark>', '</mark>', '...', 32) FROM session_fts WHERE session_fts MATCH ?1 LIMIT ?2"
+            "SELECT session_id, title, directory, snippet(session_search, 3, '<mark>', '</mark>', '...', 32)
+             FROM session_search WHERE session_search MATCH ?1 LIMIT ?2"
         ).map_err(|e| format!("FTS search error: {}", e))?;
 
         let results = stmt.query_map(params![fts_query, limit as i64], |row| {
             Ok(FtsResult {
-                title: row.get(0)?,
-                directory: row.get(1)?,
-                snippet: row.get(2)?,
+                session_id: row.get(0)?,
+                title: row.get(1)?,
+                directory: row.get(2)?,
+                snippet: row.get(3)?,
             })
         }).map_err(|e| format!("FTS query error: {}", e))?
         .filter_map(|r| r.ok())
@@ -173,6 +176,7 @@ pub struct CachedSession {
 
 #[derive(Debug, Clone)]
 pub struct FtsResult {
+    pub session_id: String,
     pub title: Option<String>,
     pub directory: Option<String>,
     pub snippet: String,

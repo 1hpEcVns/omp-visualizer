@@ -3,8 +3,8 @@ use std::fs;
 use chrono::DateTime;
 
 use crate::models::*;
-use super::parser;
 
+use super::index::SessionIndex;
 /// Represents a discovered session for listing
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
@@ -54,8 +54,8 @@ pub fn decode_session_dir(encoded: &str, home: &Path) -> String {
     encoded.to_string()
 }
 
-/// List all sessions from the sessions directory.
-pub fn list_sessions(sessions_dir: &Path) -> Vec<ConversationSummary> {
+/// List all sessions from the sessions directory. Uses SQLite index cache when provided.
+pub fn list_sessions(sessions_dir: &Path, index: Option<&SessionIndex>) -> Vec<ConversationSummary> {
     let mut summaries = Vec::new();
     let home = dirs_fallback();
 
@@ -92,10 +92,43 @@ pub fn list_sessions(sessions_dir: &Path) -> Vec<ConversationSummary> {
                 continue;
             }
 
-            // Read header to extract metadata
+            // Compute fingerprint for cache lookup
+            let fingerprint = SessionIndex::compute_fingerprint(&file_path);
+
+            // Try cache first
+            if let Some(fp) = &fingerprint {
+                if let Some(idx) = index {
+                    // Read header lightly to get ID for cache key
+                    if let Ok(info) = read_session_metadata(&file_path) {
+                        if let Some(cached) = idx.get_cached_meta(&info.id, fp) {
+                            let ts_parsed = DateTime::parse_from_rfc3339(&cached.timestamp)
+                                .ok()
+                                .map(|dt| dt.timestamp_millis());
+
+                            summaries.push(ConversationSummary {
+                                id: info.id,
+                                title: cached.title,
+                                directory: cached.directory.or(Some(decoded_dir.clone())),
+                                git_branch: None,
+                                version: Some("3".to_string()),
+                                project_id: None,
+                                parent_id: None,
+                                time_created: ts_parsed,
+                                time_updated: ts_parsed,
+                                model: Some("Unknown".to_string()),
+                                message_count: cached.message_count,
+                                subagent_count: cached.subagent_count,
+                                first_problem: None,
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            // Cache miss: read full metadata
             match read_session_metadata(&file_path) {
                 Ok(info) => {
-                    // Count subagent files (subdirectories or sibling .jsonl files)
                     let stem = file_path.file_stem().unwrap_or_default().to_string_lossy();
                     let artifact_dir = file_path.parent().map(|p| p.join(stem.as_ref())).unwrap_or_default();
                     let subagent_count = count_subagent_files(&artifact_dir);
@@ -103,6 +136,19 @@ pub fn list_sessions(sessions_dir: &Path) -> Vec<ConversationSummary> {
                     let ts_parsed = DateTime::parse_from_rfc3339(&info.timestamp)
                         .ok()
                         .map(|dt| dt.timestamp_millis());
+
+                    // Store in cache for next time
+                    if let (Some(idx), Some(fp)) = (index, &fingerprint) {
+                        let _ = idx.store_meta(
+                            &info.id,
+                            info.title.as_deref(),
+                            &decoded_dir,
+                            &info.timestamp,
+                            info.message_count,
+                            subagent_count,
+                            fp,
+                        );
+                    }
 
                     summaries.push(ConversationSummary {
                         id: info.id.clone(),

@@ -10,7 +10,6 @@ pub struct ParsedSession {
     pub entries: Vec<SessionEntry>,
     pub file_path: PathBuf,
     pub jsonl_file: String,  // relative path from sessions dir
-    pub line_count: usize,
 }
 
 /// Parse a single omp JSONL session file.
@@ -20,21 +19,16 @@ pub fn parse_session_file(path: &Path, _sessions_dir: &Path, jsonl_file: &str) -
 
     let mut header: Option<SessionHeader> = None;
     let mut entries: Vec<SessionEntry> = Vec::new();
-    let mut line_count: usize = 0;
 
     for line in reader.lines() {
         let line = line.map_err(|e| format!("Read error: {}", e))?;
-        line_count += 1;
         if line.trim().is_empty() {
             continue;
         }
 
-        if line_count <= 3 || line_count % 20 == 0 {
-            tracing::info!("Parsing line {} ({} chars)...", line_count, line.len());
-        }
         match serde_json::from_str::<SessionEntry>(&line) {
             Ok(SessionEntry::SessionHeader(h)) => {
-                tracing::info!("Line {} is session header: id={}", line_count, h.id);
+                tracing::info!("Session header found: id={}", h.id);
                 if header.is_none() {
                     header = Some(h);
                 }
@@ -43,11 +37,7 @@ pub fn parse_session_file(path: &Path, _sessions_dir: &Path, jsonl_file: &str) -
                 entries.push(entry);
             }
             Err(e) => {
-                if line_count <= 5 {
-                    tracing::warn!("Line {} deser error: {} (line: {:.100}...)", line_count, e, line);
-                } else {
-                    tracing::debug!("Skipping unparseable line {} in {}: {}", line_count, path.display(), e);
-                }
+                tracing::debug!("Skipping unparseable line in {}: {}", path.display(), e);
             }
         }
     }
@@ -59,13 +49,41 @@ pub fn parse_session_file(path: &Path, _sessions_dir: &Path, jsonl_file: &str) -
         entries,
         file_path: path.to_path_buf(),
         jsonl_file: jsonl_file.to_string(),
-        line_count,
     })
 }
 
-/// Parse one line as a SessionEntry. Returns None if unparseable.
+
+/// Parse a single line as a SessionEntry. Returns None if unparseable.
 pub fn parse_entry(line: &str) -> Option<SessionEntry> {
     serde_json::from_str::<SessionEntry>(line).ok()
+}
+
+/// Determine the kind string for a capsule seed (matching minelogue frontend expectations).
+pub fn entry_kind(entry: &SessionEntry) -> &'static str {
+    match entry {
+        SessionEntry::Message(msg) => {
+            match msg.message.role.as_str() {
+                "user" | "developer" => "message.user",
+                "assistant" => "message.assistant",
+                "toolResult" | "tool_result" => "message.tool_result",
+                _ => "message.other",
+            }
+        }
+        SessionEntry::Compaction(_) => "raw.compaction",
+        SessionEntry::BranchSummary(_) => "raw.branch_summary",
+        SessionEntry::ModelChange(_) => "raw.model_change",
+        SessionEntry::ThinkingLevelChange(_) => "raw.thinking_level_change",
+        SessionEntry::ModeChange(_) => "raw.mode_change",
+        SessionEntry::TitleChange(_) | SessionEntry::Title(_) => "raw.title_change",
+        SessionEntry::Label(_) => "raw.label",
+        SessionEntry::Custom(_) => "raw.custom",
+        SessionEntry::CustomMessage(_) => "raw.custom_message",
+        SessionEntry::TtsrInjection(_) => "raw.ttsr_injection",
+        SessionEntry::SessionInit(_) => "raw.session_init",
+        SessionEntry::McpToolSelection(_) => "raw.mcp_tool_selection",
+        SessionEntry::ServiceTierChange(_) => "raw.service_tier_change",
+        SessionEntry::SessionHeader(_) => "raw.session",
+    }
 }
 
 /// Extract a 140-char preview from entry data for capsule seeds.
@@ -145,33 +163,6 @@ pub fn extract_preview(entry: &SessionEntry) -> String {
     }
 }
 
-/// Determine the kind string for a capsule seed.
-pub fn entry_kind(entry: &SessionEntry) -> &'static str {
-    match entry {
-        SessionEntry::Message(msg) => {
-            match msg.message.role.as_str() {
-                "user" | "developer" => "message.user",
-                "assistant" => "message.assistant",
-                "toolResult" | "tool_result" => "message.tool_result",
-                _ => "message.other",
-            }
-        }
-        SessionEntry::Compaction(_) => "raw.compaction",
-        SessionEntry::BranchSummary(_) => "raw.branch_summary",
-        SessionEntry::ModelChange(_) => "raw.model_change",
-        SessionEntry::ThinkingLevelChange(_) => "raw.thinking_level_change",
-        SessionEntry::ModeChange(_) => "raw.mode_change",
-        SessionEntry::TitleChange(_) | SessionEntry::Title(_) => "raw.title_change",
-        SessionEntry::Label(_) => "raw.label",
-        SessionEntry::Custom(_) => "raw.custom",
-        SessionEntry::CustomMessage(_) => "raw.custom_message",
-        SessionEntry::TtsrInjection(_) => "raw.ttsr_injection",
-        SessionEntry::SessionInit(_) => "raw.session_init",
-        SessionEntry::McpToolSelection(_) => "raw.mcp_tool_selection",
-        SessionEntry::ServiceTierChange(_) => "raw.service_tier_change",
-        SessionEntry::SessionHeader(_) => "raw.session",
-    }
-}
 
 /// Build capsule seeds in the compact format expected by the minelogue frontend JS.
 /// Format: { k, ln, ei, mid?, role?, parts?, pv, ts, rt?, rs?, pe? }

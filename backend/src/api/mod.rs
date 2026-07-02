@@ -1,7 +1,7 @@
 mod routes;
 
 use axum::Router;
-use crate::api::routes::{AppState, default_state};
+use crate::api::routes::default_state;
 use tower_http::cors::{CorsLayer, Any};
 use tower_http::services::ServeDir;
 

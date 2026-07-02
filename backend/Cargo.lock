@@ -863,6 +863,7 @@ dependencies = [
  "chrono",
  "flate2",
  "hex",
+ "parking_lot",
  "rusqlite",
  "serde",
  "serde_json",
