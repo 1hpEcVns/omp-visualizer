@@ -21,29 +21,29 @@
 
       <section class="agent-panel active" role="tabpanel" aria-label="OMP sessions">
         <form class="session-search" method="get">
-          <input name="q" value="{{ query }}" placeholder="Search title, directory, or id" aria-label="Search sessions" />
-          <input name="directory" value="{{ directory }}" placeholder="Directory filter" aria-label="Directory filter" />
+          <input name="q" value="" placeholder="Search title, directory, or id" aria-label="Search sessions" />
+          <input name="directory" value="" placeholder="Directory filter" aria-label="Directory filter" />
           <button type="submit">Search</button>
         </form>
 
+        {% if sessions %}
         <ul class="session-list">
-          {% for session in sessions %}
+          {% for s in sessions %}
           <li class="session-card">
-            <a href="/conversation/omp/{{ session.id }}">
-              <h3>{{ session.title }}</h3>
-              <p class="session-directory">{{ session.directory }}</p>
+            <a href="/conversation/omp/{{ s.id }}">
+              <h3>{% if s.title %}{{ s.title }}{% else %}Untitled{% endif %}</h3>
+              <p class="session-directory">{% if s.directory %}{{ s.directory }}{% endif %}</p>
               <div class="session-meta">
-                <span>{{ session.messageCount }} entries</span>
-                {% if session.subagentCount > 0 %}
-                <span>{{ session.subagentCount }} subagents</span>
+                <span>{{ s.messageCount }} entries</span>
+                {% if s.subagentCount > 0 %}
+                <span>{{ s.subagentCount }} subagents</span>
                 {% endif %}
               </div>
             </a>
           </li>
           {% endfor %}
         </ul>
-
-        {% if sessions | length == 0 %}
+        {% else %}
         <section class="empty-state">
           <p>No OMP sessions found.</p>
           <p>Sessions are expected in <code>~/.omp/agent/sessions/</code></p>

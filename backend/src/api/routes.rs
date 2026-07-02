@@ -7,13 +7,14 @@ use axum::{
 };
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tower_http::compression::CompressionLayer;
 use flate2::write::GzEncoder;
 use std::io::Write;
 
 use crate::models::*;
 use crate::session::{parser, store};
+use crate::session::index::SessionIndex;
 
 // ── Application State ──────────────────────────────────────────────
 
@@ -21,6 +22,7 @@ use crate::session::{parser, store};
 pub struct AppState {
     pub sessions_dir: std::path::PathBuf,
     pub templates: Arc<tera::Tera>,
+    pub index: Arc<Mutex<SessionIndex>>,
 }
 
 // ── Page Routes ────────────────────────────────────────────────────
@@ -61,9 +63,17 @@ pub fn default_state() -> AppState {
         tera::Tera::default()
     });
 
+    let index = SessionIndex::open(None)
+        .unwrap_or_else(|e| {
+            tracing::warn!("Could not open session index: {}", e);
+            // Create in-memory fallback
+            SessionIndex::open(Some(":memory:")).unwrap()
+        });
+
     AppState {
         sessions_dir,
         templates: Arc::new(tera),
+        index: Arc::new(Mutex::new(index)),
     }
 }
 
@@ -255,30 +265,100 @@ async fn api_timeline(
     Path(session_id): Path<String>,
     req: axum::http::Request<axum::body::Body>,
 ) -> Result<Response, StatusCode> {
+    // Check if we have a cached boot payload
+    let session_file = find_session_file(&state.sessions_dir, &session_id)?;
+    let fingerprint = SessionIndex::compute_fingerprint(&session_file);
+
+    // Check cache
+    if let Some(fp) = &fingerprint {
+        let index = state.index.lock().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        if let Some(cached) = index.get_cached_boot(&session_id, fp) {
+            drop(index);
+            // Check If-None-Match for 304
+            let etag = format!("\"{}\"", fp);
+            if let Some(if_none_match) = req.headers().get("if-none-match") {
+                if if_none_match.to_str().unwrap_or("") == etag {
+                    return Ok(Response::builder()
+                        .status(StatusCode::NOT_MODIFIED)
+                        .header("etag", &etag)
+                        .body(axum::body::Body::empty())
+                        .unwrap());
+                }
+            }
+            // Serve from cache
+            let accept_encoding = req.headers()
+                .get(header::ACCEPT_ENCODING)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if accept_encoding.contains("gzip") {
+                return Ok(Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::CONTENT_ENCODING, "gzip")
+                    .header("etag", &etag)
+                    .header("vary", "Accept-Encoding")
+                    .body(axum::body::Body::from(cached))
+                    .unwrap());
+            } else {
+                // Decompress cached gzip
+                use std::io::Read;
+                let mut decoder = flate2::read::GzDecoder::new(&cached[..]);
+                let mut decompressed = Vec::new();
+                decoder.read_to_end(&mut decompressed).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+                return Ok(Response::builder()
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("etag", &etag)
+                    .body(axum::body::Body::from(decompressed))
+                    .unwrap());
+            }
+        }
+    }
+
     tracing::info!("Starting timeline build for {}", session_id);
     let payload = build_timeline_payload(&state, &session_id)?;
     tracing::info!("Timeline build complete");
 
     let body = serde_json::to_vec(&payload).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    let etag = fingerprint.as_ref().map(|fp| format!("\"{}\"", fp));
+
     let accept_encoding = req.headers()
         .get(header::ACCEPT_ENCODING)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
+    // Store in cache for future requests
+    if let (Some(fp), Some(etag_str)) = (&fingerprint, &etag) {
+        if let Ok(index) = state.index.lock() {
+            let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::new(6));
+            if encoder.write_all(&body).is_ok() {
+                if let Ok(compressed) = encoder.finish() {
+                    let _ = index.store_boot(&session_id, fp, &compressed);
+                }
+            }
+        }
+    }
+
+    let accept_encoding = req.headers()
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let mut resp = Response::builder()
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(ref etag_str) = etag {
+        resp = resp.header("etag", etag_str);
+    }
+
     if accept_encoding.contains("gzip") {
         let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::new(6));
         encoder.write_all(&body).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
         let compressed = encoder.finish().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        Ok(Response::builder()
-            .header(header::CONTENT_TYPE, "application/json")
+        Ok(resp
             .header(header::CONTENT_ENCODING, "gzip")
             .body(axum::body::Body::from(compressed))
             .unwrap())
     } else {
-        Ok(Response::builder()
-            .header(header::CONTENT_TYPE, "application/json")
+        Ok(resp
             .body(axum::body::Body::from(body))
             .unwrap())
     }
